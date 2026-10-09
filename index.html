@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>砂あそび</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<style>
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;overflow:hidden;overscroll-behavior:none;background:#0e1119;font-family:sans-serif;-webkit-user-select:none;user-select:none}
+#app{display:flex;flex-direction:column;height:100%;height:100dvh}
+#bar{background:#161a24;padding:4px 6px}
+#bar button,#bar select{font-size:14px;padding:6px 8px;margin:2px;border-radius:6px;border:1px solid #556;background:#e9edf5;color:#222}
+#bar button.on{background:#ffb347;border-color:#c60;font-weight:bold}
+#stage{flex:1;position:relative;display:flex;align-items:center;justify-content:center;overflow:hidden}
+canvas{touch-action:none;display:block}
+#pal{background:#161a24;display:flex;flex-wrap:wrap;justify-content:center;padding:5px 4px 8px}
+.sw{width:30px;height:30px;border-radius:50%;border:2px solid #556;margin:3px;padding:0}
+.sw.sel{border:3px solid #fff;transform:scale(1.15)}
+#toast{position:absolute;left:50%;bottom:14px;transform:translateX(-50%);background:rgba(0,0,0,.78);color:#fff;padding:8px 12px;border-radius:8px;font-size:14px;display:none;max-width:90%;text-align:center}
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="bar">
+    <div>
+      <button id="tSand" class="on">砂</button><button id="tWall">壁</button><button id="tErase">消しゴム</button><select id="size"><option value="1.5">太さ：細</option><option value="2.5" selected>太さ：中</option><option value="4">太さ：太</option></select><button id="flowBtn">流れ：ON</button><button id="soundBtn">音：ON</button>
+    </div>
+    <div>
+      <button id="hgBtn">砂時計</button><button id="clrSand">砂を消す</button><button id="clrAll">全部消す</button><button id="saveBtn">保存</button>
+    </div>
+  </div>
+  <div id="stage"><canvas id="cv"></canvas><div id="toast"></div></div>
+  <div id="pal"></div>
+</div>
+<script>
+const $ = id => document.getElementById(id);
+const cv = $('cv'), ctx = cv.getContext('2d');
+const DPR = Math.min(window.devicePixelRatio || 1, 3), C = 3; // C：砂粒1つの大きさ（画面上のピクセル）
+const EMPTY = 0, SAND = 1, WALL = 2;
+const DIRS = [[1, 0], [1, 1], [0, 1], [-1, 1], [-1, 0], [-1, -1], [0, -1], [1, -1]]; // 右から時計回りに8方向
+const PALETTE = ['#f2e3c6', '#f6c945', '#f39c4a', '#e8585b', '#f28fb5', '#a77bd8', '#4a8fe7', '#5fd0e0', '#62c370', '#3a3a3a', 'rainbow'];
+let cols = 0, rows = 0, type, mark, px, img, small, sctx, bgGrad;
+let tool = 'sand', color = PALETTE[1], hue = 0, flowOn = true, soundOn = true, tick = 1;
+let grav = {x: 0, y: 0}, motionOK = false, keys = {x: 0, y: 0}, paused = false;
+let ptr = {down: false, x: 0, y: 0, lx: 0, ly: 0}, lastVib = 0, toastTm = null;
+let actx = null, gainNode = null;
+
+// ---------- 共通 ----------
+function toast(t) {
+  const el = $('toast'); el.textContent = t; el.style.display = 'block';
+  clearTimeout(toastTm); toastTm = setTimeout(() => el.style.display = 'none', 3500);
+}
+function vib(p) { try { if (navigator.vibrate) navigator.vibrate(p); } catch (e) {} }
+
+// ---------- 画面の準備 ----------
+function setup() {
+  const st = $('stage').getBoundingClientRect();
+  cols = Math.floor(st.width / C); rows = Math.floor(st.height / C);
+  const N = cols * rows;
+  type = new Uint8Array(N); mark = new Uint16Array(N);
+  small = document.createElement('canvas'); small.width = cols; small.height = rows; sctx = small.getContext('2d');
+  img = sctx.createImageData(cols, rows); px = new Uint32Array(img.data.buffer);
+  cv.width = Math.round(cols * C * DPR); cv.height = Math.round(rows * C * DPR);
+  bgGrad = ctx.createLinearGradient(0, 0, 0, cv.height);
+  bgGrad.addColorStop(0, '#1f2638'); bgGrad.addColorStop(1, '#0e1119');
+  fit();
+  toast('指でなぞると砂が出ます。スマホを傾けると流れます');
+}
+function fit() {
+  if (!cols) return;
+  const st = $('stage').getBoundingClientRect(), w = cols * C, h = rows * C, k = Math.min(st.width / w, st.height / h);
+  cv.style.width = w * k + 'px'; cv.style.height = h * k + 'px';
+}
+window.addEventListener('resize', fit);
+
+// ---------- 色 ----------
+function hexRGB(h) { const n = parseInt(h.slice(1), 16); return [n >> 16 & 255, n >> 8 & 255, n & 255]; }
+function hslRGB(h, s, l) {
+  const a = s * Math.min(l, 1 - l), f = n => { const k = (n + h / 30) % 12; return 255 * (l - a * Math.max(-1, Math.min(k - 3, 9 - k, 1))); };
+  return [f(0), f(8), f(4)];
+}
+function pack(rgb, k) {
+  const c = v => Math.max(0, Math.min(255, Math.round(v * k)));
+  return ((255 << 24) | (c(rgb[2]) << 16) | (c(rgb[1]) << 8) | c(rgb[0])) >>> 0;
+}
+// 粒ごとに濃淡をつけ、ときどき光る粒を混ぜる
+function sandColor() {
+  const rgb = color === 'rainbow' ? hslRGB(hue, .8, .62) : hexRGB(color);
+  return pack(rgb, Math.random() < .03 ? 1.3 : .86 + Math.random() * .26);
+}
+const WALLRGB = hexRGB('#9aa3b2');
+const setWall = i => { type[i] = WALL; px[i] = pack(WALLRGB, .94 + Math.random() * .12); };
+
+// ---------- 描く・注ぐ ----------
+function disc(cx, cy, r, fn) {
+  const R = Math.ceil(r), x0 = Math.round(cx), y0 = Math.round(cy);
+  for (let dy = -R; dy <= R; dy++) for (let dx = -R; dx <= R; dx++) {
+    if (dx * dx + dy * dy > r * r) continue;
+    const x = x0 + dx, y = y0 + dy;
+    if (x >= 0 && y >= 0 && x < cols && y < rows) fn(y * cols + x);
+  }
+}
+function spray(cx, cy, r, n) {
+  for (let k = 0; k < n; k++) {
+    const a = Math.random() * 6.283, d = Math.sqrt(Math.random()) * r;
+    const x = Math.round(cx + Math.cos(a) * d), y = Math.round(cy + Math.sin(a) * d);
+    if (x < 0 || y < 0 || x >= cols || y >= rows) continue;
+    const i = y * cols + x;
+    if (type[i] === EMPTY) { type[i] = SAND; px[i] = sandColor(); }
+  }
+}
+function apply(cx, cy, still) {
+  const r = Number($('size').value);
+  if (tool === 'sand') spray(cx, cy, r, still ? Math.ceil(r * 2) : Math.ceil(r));
+  else if (tool === 'wall') disc(cx, cy, r * .7 + .8, setWall);
+  else disc(cx, cy, r + 2, i => { type[i] = EMPTY; px[i] = 0; });
+}
+function line(x1, y1, x2, y2, r) {
+  const n = Math.ceil(Math.max(Math.abs(x2 - x1), Math.abs(y2 - y1)) * 2) || 1;
+  for (let s = 0; s <= n; s++) disc(x1 + (x2 - x1) * s / n, y1 + (y2 - y1) * s / n, r, setWall);
+}
+function toCell(e) { const b = cv.getBoundingClientRect(); return [(e.clientX - b.left) / b.width * cols, (e.clientY - b.top) / b.height * rows]; }
+cv.addEventListener('pointerdown', e => {
+  initAudio();
+  const [x, y] = toCell(e);
+  cv.setPointerCapture(e.pointerId);
+  ptr = {down: true, x, y, lx: x, ly: y};
+  apply(x, y, false);
+});
+cv.addEventListener('pointermove', e => { if (!ptr.down) return; const [x, y] = toCell(e); ptr.x = x; ptr.y = y; });
+cv.addEventListener('pointerup', () => ptr.down = false);
+cv.addEventListener('pointercancel', () => ptr.down = false);
+cv.addEventListener('contextmenu', e => e.preventDefault());
+// 指の通り道に沿って砂を出す。指を止めると、その場に湧き出し続ける
+function input() {
+  if (!ptr.down) return;
+  const dx = ptr.x - ptr.lx, dy = ptr.y - ptr.ly, d = Math.hypot(dx, dy);
+  if (d < .5) { if (tool === 'sand') apply(ptr.x, ptr.y, true); }
+  else {
+    const n = Math.ceil(d);
+    for (let s = 1; s <= n; s++) apply(ptr.lx + dx * s / n, ptr.ly + dy * s / n, false);
+    ptr.lx = ptr.x; ptr.ly = ptr.y;
+    if (soundOn && tool === 'sand' && performance.now() - lastVib > 60) { lastVib = performance.now(); vib(4); }
+  }
+  if (tool === 'sand') hue = (hue + 1.2) % 360;
+}
+
+// ---------- 砂の流れ ----------
+function tryDir(x, y, k) {
+  const [dx, dy] = DIRS[k], nx = x + dx, ny = y + dy;
+  if (nx < 0 || ny < 0 || nx >= cols || ny >= rows) return -1;
+  const j = ny * cols + nx;
+  if (type[j] !== EMPTY) return -1;
+  if (dx && dy && type[y * cols + nx] !== EMPTY && type[ny * cols + x] !== EMPTY) return -1; // 角のすき間はすり抜けない
+  return j;
+}
+// 傾いた方向が空いていれば進み、ふさがっていれば斜めを試す
+function step(k) {
+  const [dx, dy] = DIRS[k];
+  tick = tick === 65535 ? 1 : tick + 1;
+  let moved = 0;
+  const yS = dy > 0 ? rows - 1 : 0, yE = dy > 0 ? -1 : rows, yI = dy > 0 ? -1 : 1;
+  for (let y = yS; y !== yE; y += yI) {
+    const rev = dx === 0 ? Math.random() < .5 : dx > 0;
+    for (let n = 0; n < cols; n++) {
+      const x = rev ? cols - 1 - n : n, i = y * cols + x;
+      if (type[i] !== SAND || mark[i] === tick) continue;
+      if (Math.random() < .03) continue;
+      let j = tryDir(x, y, k);
+      if (j < 0) {
+        const a = Math.random() < .5 ? 1 : -1;
+        j = tryDir(x, y, (k + a) & 7);
+        if (j < 0) j = tryDir(x, y, (k - a + 8) & 7);
+        if (j < 0 && Math.random() < .08) { j = tryDir(x, y, (k + 2 * a + 8) & 7); if (j < 0) j = tryDir(x, y, (k - 2 * a + 8) & 7); }
+      }
+      if (j >= 0) { type[j] = SAND; px[j] = px[i]; type[i] = EMPTY; px[i] = 0; mark[j] = tick; moved++; }
+    }
+  }
+  return moved;
+}
+
+// ---------- 重力の向き ----------
+window.addEventListener('devicemotion', e => {
+  const a = e.accelerationIncludingGravity;
+  if (!a || a.x == null || a.y == null) return;
+  motionOK = true;
+  const gx = -a.x / 9.8, gy = a.y / 9.8;
+  grav.x += (gx - grav.x) * .3; grav.y += (gy - grav.y) * .3;
+});
+const KEYMAP = {ArrowLeft: ['x', -1], ArrowRight: ['x', 1], ArrowUp: ['y', -1], ArrowDown: ['y', 1]};
+addEventListener('keydown', e => { const k = KEYMAP[e.key]; if (k) { keys[k[0]] = k[1]; e.preventDefault(); } });
+addEventListener('keyup', e => { const k = KEYMAP[e.key]; if (k && keys[k[0]] === k[1]) keys[k[0]] = 0; });
+
+// ---------- 音 ----------
+function initAudio() {
+  if (actx) { if (actx.state === 'suspended') actx.resume(); return; }
+  try {
+    actx = new (window.AudioContext || window.webkitAudioContext)();
+    const len = actx.sampleRate * 2, buf = actx.createBuffer(1, len, actx.sampleRate), d = buf.getChannelData(0);
+    // 小さな「カサッ」という音をたくさん散らして、砂がこすれる音にする
+    for (let i = 0; i < len; i++) {
+      if (Math.random() < .015) {
+        const amp = Math.random() * 2 - 1, L = 20 + Math.random() * 40 | 0;
+        for (let j = 0; j < L && i + j < len; j++) d[i + j] += amp * (Math.random() * 2 - 1) * Math.exp(-j / 8);
+      }
+    }
+    const src = actx.createBufferSource(); src.buffer = buf; src.loop = true;
+    const bp = actx.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = 4500; bp.Q.value = .6;
+    const hp = actx.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 1200;
+    gainNode = actx.createGain(); gainNode.gain.value = 0;
+    src.connect(bp); bp.connect(hp); hp.connect(gainNode); gainNode.connect(actx.destination); src.start();
+  } catch (e) { actx = null; }
+}
+function sound(moved) {
+  if (!actx || !gainNode) return;
+  const pour = ptr.down && tool === 'sand' ? .06 : 0;
+  const t = soundOn ? Math.min(.45, Math.sqrt(moved) / 300 * .45 + pour) : 0;
+  gainNode.gain.setTargetAtTime(t, actx.currentTime, .06);
+}
+
+// ---------- ボタン ----------
+function setTool(t) {
+  tool = t;
+  $('tSand').classList.toggle('on', t === 'sand'); $('tWall').classList.toggle('on', t === 'wall'); $('tErase').classList.toggle('on', t === 'erase');
+}
+$('tSand').onclick = () => setTool('sand');
+$('tWall').onclick = () => setTool('wall');
+$('tErase').onclick = () => setTool('erase');
+$('flowBtn').onclick = () => {
+  flowOn = !flowOn; $('flowBtn').textContent = '流れ：' + (flowOn ? 'ON' : 'OFF'); $('flowBtn').classList.toggle('on', !flowOn);
+};
+$('soundBtn').onclick = () => { soundOn = !soundOn; $('soundBtn').textContent = '音：' + (soundOn ? 'ON' : 'OFF'); };
+function clearSand() { for (let i = 0; i < type.length; i++) if (type[i] === SAND) { type[i] = EMPTY; px[i] = 0; } }
+function clearAll() { type.fill(0); px.fill(0); }
+$('clrSand').onclick = clearSand;
+$('clrAll').onclick = () => { if (confirm('砂と壁を全部消しますか？')) clearAll(); };
+$('hgBtn').onclick = () => {
+  if (type.some(v => v) && !confirm('いまの砂と壁を消して、砂時計を作りますか？')) return;
+  clearAll();
+  const cx = Math.floor(cols / 2), y0 = Math.floor(rows * .07), y1 = Math.floor(rows * .93), ym = Math.floor((y0 + y1) / 2);
+  const hw = Math.floor(cols * .38), n = 3;
+  line(cx - hw, y0, cx + hw, y0, 1.2); line(cx - hw, y1, cx + hw, y1, 1.2);
+  line(cx - hw, y0, cx - n, ym, 1.2); line(cx - n, ym, cx - hw, y1, 1.2);
+  line(cx + hw, y0, cx + n, ym, 1.2); line(cx + n, ym, cx + hw, y1, 1.2);
+  const bands = ['#f2e3c6', '#f6c945', '#f39c4a', '#e8585b', '#a77bd8', '#4a8fe7', '#5fd0e0'];
+  const top = y0 + 3, bottom = Math.floor(y0 + (ym - y0) * .7), bh = Math.max(1, (bottom - top + 1) / bands.length);
+  for (let y = top; y <= bottom; y++) {
+    const w = n + (hw - n) * (ym - y) / (ym - y0) - 2.5, rgb = hexRGB(bands[Math.floor((y - top) / bh) % bands.length]);
+    for (let x = Math.ceil(cx - w); x <= Math.floor(cx + w); x++) {
+      const i = y * cols + x; type[i] = SAND; px[i] = pack(rgb, Math.random() < .03 ? 1.3 : .86 + Math.random() * .26);
+    }
+  }
+  toast('スマホを立てると砂が落ち始めます。逆さにすると、また最初から');
+};
+$('saveBtn').onclick = () => {
+  const d = new Date(), z = v => String(v).padStart(2, '0');
+  const name = `suna-${d.getFullYear()}${z(d.getMonth() + 1)}${z(d.getDate())}-${z(d.getHours())}${z(d.getMinutes())}.png`;
+  cv.toBlob(b => {
+    if (!b) return;
+    const a = document.createElement('a'); a.href = URL.createObjectURL(b); a.download = name;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000); toast('画像を保存しました');
+  }, 'image/png');
+};
+PALETTE.forEach(c => {
+  const b = document.createElement('button'); b.className = 'sw' + (c === color ? ' sel' : '');
+  b.style.background = c === 'rainbow' ? 'conic-gradient(red,orange,yellow,lime,cyan,blue,magenta,red)' : c;
+  b.onclick = () => { color = c; setTool('sand'); document.querySelectorAll('.sw').forEach(x => x.classList.toggle('sel', x === b)); };
+  $('pal').appendChild(b);
+});
+
+// ---------- 描画 ----------
+function draw() {
+  sctx.putImageData(img, 0, 0);
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.fillStyle = bgGrad; ctx.fillRect(0, 0, cv.width, cv.height);
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(small, 0, 0, cv.width, cv.height);
+  if (paused) {
+    ctx.fillStyle = 'rgba(0,0,0,.6)'; ctx.fillRect(0, 0, cv.width, cv.height);
+    ctx.fillStyle = '#fff'; ctx.font = `bold ${20 * DPR}px sans-serif`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText('画面を縦向きに戻してください', cv.width / 2, cv.height / 2);
+  }
+}
+
+// ---------- 毎コマの処理 ----------
+function loop() {
+  let moved = 0;
+  paused = motionOK && innerWidth > innerHeight;
+  if (!paused) {
+    input();
+    if (flowOn) {
+      let gx, gy;
+      if (motionOK) { gx = grav.x; gy = grav.y; } else { gx = keys.x; gy = keys.y; if (!gx && !gy) gy = 1; }
+      const m = Math.hypot(gx, gy);
+      if (m > .08) {
+        // 8方向の間の角度は、近い2方向を確率で混ぜてなめらかにする
+        const f = ((Math.atan2(gy, gx) / (Math.PI / 4)) % 8 + 8) % 8, k0 = Math.floor(f), fr = f - k0;
+        const passes = m > .6 ? 3 : m > .3 ? 2 : 1;
+        for (let p = 0; p < passes; p++) moved += step((Math.random() < fr ? k0 + 1 : k0) & 7);
+      }
+    }
+  }
+  sound(moved);
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(() => { setup(); requestAnimationFrame(loop); });
+</script>
+</body>
+</html>
